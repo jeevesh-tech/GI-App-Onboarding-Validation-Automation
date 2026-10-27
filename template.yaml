@@ -1,0 +1,257 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Fluid-powered EC2 provisioning and status tracking
+
+# ── Deploy command ─────────────────────────────────────────────────────────────
+# sam build
+# sam deploy --guided
+#   (first run — walks through all parameters and saves samconfig.toml)
+# sam deploy
+#   (subsequent runs — uses saved samconfig.toml)
+# ──────────────────────────────────────────────────────────────────────────────
+
+Parameters:
+
+  AmiIdLinux:
+    Type: AWS::EC2::Image::Id
+    Description: AMI ID for Linux instances (e.g. Amazon Linux 2023)
+
+  AmiIdWindows:
+    Type: AWS::EC2::Image::Id
+    Description: AMI ID for Windows instances (e.g. Windows Server 2022 Base)
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Subnet to launch EC2 instances into
+
+  SecurityGroupIds:
+    Type: String
+    Description: Comma-separated list of security group IDs for EC2 instances
+
+  InstanceProfile:
+    Type: String
+    Description: >
+      IAM instance profile name to attach to EC2 instances.
+      The corresponding role MUST include AmazonSSMManagedInstanceCore
+      so the Worker Lambda can reach instances via SSM Run Command.
+
+  InstanceType:
+    Type: String
+    Default: t3.small
+    Description: EC2 instance type (e.g. t3.small, t3.medium)
+
+  KeyName:
+    Type: String
+    Default: ""
+    Description: >
+      EC2 key pair name for SSH access.
+      Leave blank to use SSM Session Manager only (recommended).
+
+  SplunkRealm:
+    Type: String
+    Description: "Splunk Observability realm, e.g. us0 or eu0"
+
+  SplunkAccessToken:
+    Type: String
+    NoEcho: true
+    Description: >
+      Splunk ingest access token.
+      Stored encrypted in the Lambda environment (Lambda service KMS key).
+      For stricter security, store in Secrets Manager and fetch at runtime instead.
+
+Globals:
+  Function:
+    Runtime: python3.12
+    MemorySize: 256
+    Environment:
+      Variables:
+        TABLE_NAME: !Ref GearProvisioningTable
+
+Resources:
+
+  # ── DynamoDB (source of truth) ─────────────────────────────────────────────
+  GearProvisioningTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: GearProvisioningTable
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: gear_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: gear_id
+          KeyType: HASH
+      SSESpecification:
+        SSEEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true   # enables 35-day restore window
+
+  # ── SQS queue + DLQ ───────────────────────────────────────────────────────
+  ProvisionDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: gear-provision-dlq
+      MessageRetentionPeriod: 1209600   # 14 days — time to investigate failures
+
+  ProvisionQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: gear-provision-queue
+      # VisibilityTimeout MUST exceed WorkerFunction Timeout (900 s).
+      # 960 s gives a 60-s buffer before another consumer can pick up the message.
+      VisibilityTimeout: 960
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt ProvisionDLQ.Arn
+        # maxReceiveCount=2 (one retry) — EC2 RunInstances is NOT idempotent;
+        # keep retries low to avoid launching duplicate instances.
+        maxReceiveCount: 2
+
+  # ── API Gateway (with API key auth) ───────────────────────────────────────
+  GearApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: Prod
+      Auth:
+        ApiKeyRequired: true          # all methods require x-api-key header
+        UsagePlan:
+          CreateUsagePlan: PER_API
+          UsagePlanName: GearProvisioningPlan
+          Quota:
+            Limit: 500
+            Period: DAY
+          Throttle:
+            BurstLimit: 10
+            RateLimit: 5
+
+  # ── Validator Lambda (POST /provision) ────────────────────────────────────
+  ValidatorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: lambdas/
+      Handler: validator_lambda.lambda_handler
+      Timeout: 15
+      Environment:
+        Variables:
+          QUEUE_URL: !Ref ProvisionQueue
+      Policies:
+        - DynamoDBWritePolicy:
+            TableName: !Ref GearProvisioningTable
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt ProvisionQueue.QueueName
+      Events:
+        Provision:
+          Type: Api
+          Properties:
+            RestApiId: !Ref GearApi
+            Path: /provision
+            Method: post
+
+  # ── Worker Lambda (SQS-triggered, does EC2 + SSM) ─────────────────────────
+  WorkerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: lambdas/
+      Handler: worker_lambda.lambda_handler
+      Timeout: 900           # max Lambda timeout — must match SQS VisibilityTimeout logic above
+      MemorySize: 512        # more vCPU for boto3 waiters; 256 is too tight under load
+      Environment:
+        Variables:
+          # EC2 provisioning — these replaced the wrong FLUID_API_URL / FLUID_API_TOKEN
+          AMI_ID_LINUX:        !Ref AmiIdLinux
+          AMI_ID_WINDOWS:      !Ref AmiIdWindows
+          SUBNET_ID:           !Ref SubnetId
+          SECURITY_GROUP_IDS:  !Ref SecurityGroupIds
+          INSTANCE_PROFILE:    !Ref InstanceProfile
+          INSTANCE_TYPE:       !Ref InstanceType
+          KEY_NAME:            !Ref KeyName
+          # Splunk OTel
+          SPLUNK_REALM:        !Ref SplunkRealm
+          SPLUNK_ACCESS_TOKEN: !Ref SplunkAccessToken
+      Policies:
+        - DynamoDBWritePolicy:
+            TableName: !Ref GearProvisioningTable
+        - SQSPollerPolicy:
+            QueueName: !GetAtt ProvisionQueue.QueueName
+        # EC2 and SSM permissions — these were missing from the original template
+        - Statement:
+            - Sid: EC2Provisioning
+              Effect: Allow
+              Action:
+                - ec2:RunInstances
+                - ec2:DescribeInstances
+                - ec2:DescribeInstanceStatus
+                - ec2:CreateTags
+              Resource: "*"
+            - Sid: PassInstanceProfile
+              Effect: Allow
+              Action:
+                - iam:PassRole
+              # Scope to instance profiles only — do not use "*" here
+              Resource: !Sub "arn:aws:iam::${AWS::AccountId}:instance-profile/*"
+            - Sid: SSMRunCommand
+              Effect: Allow
+              Action:
+                - ssm:SendCommand
+                - ssm:GetCommandInvocation
+                - ssm:DescribeInstanceInformation
+              Resource: "*"
+      Events:
+        QueueEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt ProvisionQueue.Arn
+            BatchSize: 1
+            FunctionResponseTypes:
+              - ReportBatchItemFailures   # partial batch failure support
+
+  # ── Status Lambda (GET /status?gear_id=xxx) ───────────────────────────────
+  StatusFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: lambdas/
+      Handler: status_lambda.lambda_handler
+      Timeout: 10            # was missing — DynamoDB lookup, 10 s is generous
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref GearProvisioningTable
+      Events:
+        Status:
+          Type: Api
+          Properties:
+            RestApiId: !Ref GearApi
+            Path: /status
+            Method: get
+
+# ── Outputs (copy these into the Excel VBA macro after deploy) ─────────────
+Outputs:
+
+  ProvisionEndpoint:
+    Description: >
+      Paste into PROVISION_API_URL in provisioning_macro.bas
+    Value: !Sub "https://${GearApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/provision"
+
+  StatusEndpoint:
+    Description: >
+      Paste into STATUS_API_URL in provisioning_macro.bas
+    Value: !Sub "https://${GearApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/status"
+
+  ApiKeyNote:
+    Description: >
+      After deployment, retrieve the generated API key value and paste into
+      API_KEY in provisioning_macro.bas. Run:
+      aws apigateway get-api-keys --include-values
+        --query "items[?contains(name,'GearProvisioning')].value | [0]"
+        --output text
+    Value: "See description — key is auto-generated by SAM"
+
+  DynamoDBTable:
+    Description: DynamoDB table name
+    Value: !Ref GearProvisioningTable
+
+  SQSQueueUrl:
+    Description: Provisioning queue URL
+    Value: !Ref ProvisionQueue
+
+  DeadLetterQueueUrl:
+    Description: DLQ URL — check here when provisioning silently fails
+    Value: !Ref ProvisionDLQ
